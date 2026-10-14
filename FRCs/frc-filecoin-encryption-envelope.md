@@ -12,7 +12,7 @@ created: 2026-10-13
 
 ## Simple Summary
 
-A standard format for encrypting data stored on Filecoin, built on COSE (RFC 9052). The envelope encodes encryption metadata (algorithm, nonce, recipient descriptors) separately from the ciphertext, enabling keyless inspection and pluggable key management. Two encryption schemes are defined: a simple AES-256-GCM mode and a seekable chunked mode for large files that supports random-access decryption.
+A standard format for encrypting data stored on Filecoin, built on COSE (RFC 9052). The envelope encodes encryption metadata (algorithm, nonce, recipient descriptors) separately from the ciphertext, enabling keyless inspection and pluggable key management. Three encryption schemes are defined: a simple AES-256-GCM mode, and two seekable chunked modes for large files that support random-access decryption, one of which also commits to its key.
 
 ## Abstract
 
@@ -20,6 +20,7 @@ This proposal defines the Filecoin Encryption Envelope (FEE): a COSE-based conta
 
 - **AES-256-GCM** (IANA algorithm 3) for simple, interoperable encryption.
 - **Chunked AES-256-GCM with the STREAM construction** (private-use algorithm -65793) for seekable encryption of large files with O(chunk_size) random-access cost, and an optional authenticated commitment to the exact plaintext length.
+- **Cobblestone-256** (private-use algorithm -65794), the C2SP chunked encryption construction, for seekable encryption that also commits to its key and lets one CEK encrypt many objects safely.
 - **Multi-recipient descriptors** that decouple key management from the data path, allowing the same encrypted blob to be accessible via different key management systems without re-encryption.
 
 The envelope is independent of any specific key management solution. Possession of the content encryption key (CEK) and knowledge of the algorithm is sufficient to decrypt, regardless of how the key was obtained.
@@ -43,6 +44,10 @@ Every application that encrypts data for Filecoin storage today must define its 
 ### Large files need seekable encryption
 
 Filecoin stores large objects. Forcing full download and decryption to read a byte range is impractical. A standard seekable encryption scheme enables HTTP Range-style access patterns over encrypted data, which media streaming, database pages, and incremental synchronization depend on.
+
+### Shared blobs need key commitment
+
+A blob shared with several recipients should decrypt to the same content for each of them. AES-GCM alone does not guarantee this: a sender can wrap a different CEK for each recipient, and each CEK can decrypt the same blob to different content. A key-committing scheme rules this out.
 
 ### Relationship to broader access controls
 
@@ -117,10 +122,10 @@ empty_or_serialized_map = bstr .cbor header_map / bstr .size 0
 protected_header_map = {
   1 => algorithm_id,                                ; alg (REQUIRED)
   16 => "application/vnd.filecoin-encryption+cose", ; typ (REQUIRED)
-  5 => bstr,                                        ; iv (REQUIRED): 12 bytes (scheme 1) or 7 bytes (scheme 2)
+  ? 5 => bstr,                                      ; iv: 12 bytes (scheme 1) or 7 bytes (scheme 2), absent for scheme 3
   ? 3 => content_type,                              ; content type of the plaintext (OPTIONAL)
-  ? -1 => uint,                                     ; chunk_size: REQUIRED for scheme 2, absent for scheme 1
-  ? -65789 => uint,                                 ; plaintext_length: scheme 2 only (OPTIONAL)
+  ? -1 => uint,                                     ; chunk_size: REQUIRED for scheme 2, absent for schemes 1 and 3
+  ? -65789 => uint,                                 ; plaintext_length: schemes 2 and 3 only (OPTIONAL)
   ? -65792 => app_metadata,                         ; application metadata (OPTIONAL)
   ? 2 => [+ label],                                 ; crit (OPTIONAL)
   * label => any                                    ; extension parameters
@@ -132,9 +137,10 @@ unprotected_header_map = {
 
 content_type = tstr / uint
 
-algorithm_id = 3 / -65793
+algorithm_id = 3 / -65793 / -65794
 ; 3      = AES-256-GCM (IANA registered)
 ; -65793 = Chunked-AES-256-GCM-STREAM (private-use)
+; -65794 = Cobblestone-256, c2sp.org/chunked-encryption@v1 (private-use)
 
 app_metadata = { * tstr => any }
 ; String-keyed map for application-level metadata.
@@ -147,25 +153,25 @@ The content header maps list the FEE fields explicitly. They MUST NOT be replace
 
 ### Protected Headers
 
-Protected headers are serialized as a CBOR byte string and authenticated as part of the AEAD additional authenticated data (AAD). Every content parameter this proposal defines is protected. They MUST NOT be modified after encryption.
+Protected headers are serialized as a CBOR byte string and authenticated: as part of the AEAD additional authenticated data (AAD) in schemes 1 and 2, and through key derivation in scheme 3. Every content parameter this proposal defines is protected. They MUST NOT be modified after encryption.
 
-| Label  | Name               | Type        | Required                | Description                                              |
-| ------ | ------------------ | ----------- | ----------------------- | -------------------------------------------------------- |
-| 1      | `alg`              | int         | REQUIRED                | Algorithm identifier                                     |
-| 3      | `content_type`     | tstr / uint | OPTIONAL                | Media type of the plaintext (e.g., `"application/pdf"`)  |
-| 5      | `iv`               | bstr        | REQUIRED                | 12-byte nonce (scheme 1) or 7-byte base nonce (scheme 2) |
-| 16     | `typ`              | tstr        | REQUIRED                | `"application/vnd.filecoin-encryption+cose"`             |
-| -1     | `chunk_size`       | uint        | Scheme 2 only           | Plaintext bytes per chunk (algorithm-specific parameter) |
-| -65789 | `plaintext_length` | uint        | OPTIONAL, scheme 2 only | Exact plaintext byte count                               |
-| -65792 | `app_metadata`     | map         | OPTIONAL                | Application metadata (see below)                         |
+| Label  | Name               | Type        | Required                  | Description                                              |
+| ------ | ------------------ | ----------- | ------------------------- | -------------------------------------------------------- |
+| 1      | `alg`              | int         | REQUIRED                  | Algorithm identifier                                     |
+| 3      | `content_type`     | tstr / uint | OPTIONAL                  | Media type of the plaintext (e.g., `"application/pdf"`)  |
+| 5      | `iv`               | bstr        | Schemes 1 and 2 only      | 12-byte nonce (scheme 1) or 7-byte base nonce (scheme 2) |
+| 16     | `typ`              | tstr        | REQUIRED                  | `"application/vnd.filecoin-encryption+cose"`             |
+| -1     | `chunk_size`       | uint        | Scheme 2 only             | Plaintext bytes per chunk (algorithm-specific parameter) |
+| -65789 | `plaintext_length` | uint        | OPTIONAL, schemes 2 and 3 | Exact plaintext byte count                               |
+| -65792 | `app_metadata`     | map         | OPTIONAL                  | Application metadata (see below)                         |
 
 Label `-1` is algorithm-specific ([RFC 9052 §3.1](https://www.rfc-editor.org/rfc/rfc9052#section-3.1)), so its meaning depends on the `alg` of the header it appears in.
 
 - In the content header with `alg = -65793` (`Chunked-AES-256-GCM-STREAM`), `-1` means `chunk_size`.
-- In the content header with `alg = 3` (`AES-256-GCM`), `-1` MUST NOT be present.
+- In the content header with `alg = 3` (`AES-256-GCM`) or `alg = -65794` (`Cobblestone-256`), `-1` MUST NOT be present.
 - In ECDH-ES recipient headers, `-1` holds the ephemeral public key, as the COSE registry defines. The `chunk_size` meaning is not registered; it relies on `alg` alone.
 
-The content `iv` parameter (label 5) MUST appear in the protected header and MUST NOT appear in the unprotected header. Protected headers are readable before authentication, so the decryptor obtains the IV before checking the tag. Placing the IV in the protected header makes it part of the content AAD.
+In schemes 1 and 2, the content `iv` parameter (label 5) MUST appear in the protected header and MUST NOT appear in the unprotected header. Protected headers are readable before authentication, so the decryptor obtains the IV before checking the tag. Placing the IV in the protected header makes it part of the content AAD. Scheme 3 has no `iv`: its salt travels at the start of the ciphertext.
 
 `plaintext_length` is defined in [Plaintext Length](#plaintext-length).
 
@@ -192,10 +198,10 @@ The content unprotected header MAY be empty. The FEE content parameters (`alg`, 
 Decoders MUST apply these rules:
 
 - Tags 16 and 96 MUST use their matching array structures. The content ciphertext field MUST be `nil`.
-- Content protected bytes MUST contain exactly one CBOR map with no trailing data. Content protected headers cannot be empty, because FEE requires `alg`, `typ` and `iv`.
+- Content protected bytes MUST contain exactly one CBOR map with no trailing data. Content protected headers cannot be empty, because FEE requires `alg` and `typ`.
 - Recipient protected bytes MUST follow the selected recipient algorithm's empty-or-map rule; an encoded map MUST also contain no trailing data. The zero-length byte string `h''` contains no CBOR item and is different from the encoded empty map `h'a0'`.
 - Header parameters MUST have the types, values and locations required by FEE and by the recipient algorithm. Content-header requirements do not automatically apply to recipient headers.
-- The protected `typ` value MUST be `application/vnd.filecoin-encryption+cose`. `chunk_size` MUST be present for scheme 2 and absent for scheme 1. The protected IV MUST have the length required by the selected scheme.
+- The protected `typ` value MUST be `application/vnd.filecoin-encryption+cose`. `chunk_size` MUST be present for scheme 2 and absent for schemes 1 and 3. The protected IV MUST be present with the length required for schemes 1 and 2, and absent for scheme 3.
 - Encoders MUST NOT produce duplicate map keys, and decoders MUST reject them. A header label appearing in both the protected and unprotected maps at the same layer MUST also be rejected. Header labels are compared by their decoded values, not by their encoded bytes.
 
 #### Critical headers
@@ -206,7 +212,7 @@ FEE-required parameters do not need to appear in `crit`, since FEE readers alrea
 
 ### Additional Authenticated Data (AAD)
 
-Both schemes construct the AAD using the COSE `Enc_structure` as defined in [RFC 9052 §5.3](https://www.rfc-editor.org/rfc/rfc9052#section-5.3):
+Schemes 1 and 2 use the COSE `Enc_structure`, as defined in [RFC 9052 §5.3](https://www.rfc-editor.org/rfc/rfc9052#section-5.3), as the AEAD's AAD. Scheme 3 uses the same bytes as the `context` input to its key derivation, and its AEAD's AAD is empty:
 
 ```
 Enc_structure = [
@@ -348,7 +354,7 @@ These checks validate the layout only. Each chunk's authentication tag MUST stil
 
 #### Plaintext Length
 
-`plaintext_length` (label -65789) is the exact number of plaintext bytes and may be zero. It is optional and appears only in the protected header of scheme 2. Every chunk authenticates the protected header, so verifying any one chunk also verifies the intended total length. A range read can then detect a shortened or extended blob without reading the final chunk.
+`plaintext_length` (label -65789) is the exact number of plaintext bytes and may be zero. It is optional and appears only in the protected header of schemes 2 and 3. This section gives the scheme 2 rules; [Declared Plaintext Length](#declared-plaintext-length) gives the scheme 3 rules. Every chunk authenticates the protected header, so verifying any one chunk also verifies the intended total length. A range read can then detect a shortened or extended blob without reading the final chunk.
 
 An encoder MAY write `plaintext_length` when it knows the length before emitting the envelope; otherwise it omits it. If the plaintext it consumes has a different length, the encoder MUST fail and MUST NOT emit the final chunk. Earlier chunks may already have been emitted.
 
@@ -380,6 +386,104 @@ To decrypt a plaintext byte range `[offset, offset + length)`:
 6. Concatenate the decrypted chunks and slice to the requested range.
 
 Only the affected chunks are fetched and decrypted, so a fixed-size range costs O(chunk_size). A range read authenticates only the chunks it reads. With `plaintext_length` present and an exact ciphertext length for the same object version, a verified chunk confirms the declared length, so a shortened or extended blob is rejected. Without it, a range that does not include the final chunk cannot detect truncation. In neither case does a range read authenticate unread chunks or prove that a remote source holds the unread bytes.
+
+### Scheme 3: Cobblestone-256 (Algorithm -65794)
+
+A seekable chunked scheme that commits to its key. It is the C2SP chunked encryption construction ([c2sp.org/chunked-encryption](https://c2sp.org/chunked-encryption), version 1) in its Cobblestone-256 instantiation: HKDF-Expand with SHA-512, and AES-256-GCM. Compared with scheme 2, it adds key commitment, derives a fresh key and nonce for every encryption so that one CEK can safely encrypt many objects, and marks the end of the plaintext by the length of the final chunk instead of a flag.
+
+- **Algorithm ID**: -65794 (private-use range)
+- **Key size**: 256 bits (32 bytes). The CEK is the construction's input key.
+- **Salt**: 24 bytes, randomly generated, carried at the start of the ciphertext. Scheme 3 has no `iv` header.
+- **Chunk size**: 16,384 bytes (16 KiB), fixed by the construction. Scheme 3 has no `chunk_size` header.
+- **Plaintext length**: OPTIONALLY committed in the protected header `plaintext_length` (label -65789) when the length is known before encryption.
+- **Maximum plaintext**: 2^38 chunks, or 4 PiB minus 1 byte.
+
+A scheme 3 ciphertext is a standard version 1 C2SP chunked encryption ciphertext, so any conforming C2SP implementation can decrypt it given the CEK and the context defined below.
+
+#### Key Derivation and Commitment
+
+For each encryption, the encoder generates a 24-byte `salt` from a cryptographically secure random source, then derives a key, base nonce and commitment:
+
+```text
+key || base_nonce || commitment = HKDF-Expand-SHA-512(
+    prk  = CEK,
+    info = "c2sp.org/chunked-encryption@v1+" || "AEAD_AES_256_GCM" || 0x00 || salt || context,
+    L    = 76)
+```
+
+`key` is 32 bytes, `base_nonce` is 12 bytes and `commitment` is 32 bytes. `context` is the serialized `Enc_structure` (see [Additional Authenticated Data](#additional-authenticated-data-aad)), the same bytes schemes 1 and 2 use as AAD. This binds the protected header into the key: changing any protected parameter, or switching between tags 16 and 96, changes the derived key and commitment.
+
+A decoder MUST derive the commitment and compare it, in constant time, with the one in the ciphertext before decrypting any chunk, and MUST reject the object on a mismatch. This check makes the scheme key-committing: a ciphertext decrypts under at most one CEK.
+
+#### Chunk Encryption
+
+The plaintext is split into 16 KiB chunks. The final chunk MUST be shorter than 16 KiB and MAY be empty, so each plaintext length has one valid chunking:
+
+| Plaintext                      | Final chunk                                        |
+| ------------------------------ | -------------------------------------------------- |
+| Empty                          | One empty chunk at index `0`                       |
+| Exact multiple of 16,384 bytes | An empty chunk after the full ones                 |
+| Any other length               | The remaining `1` through `16,383` plaintext bytes |
+
+Chunk `i` is encrypted with AES-256-GCM under `key`, with empty AAD and the nonce `base_nonce XOR i`, where `i` is encoded as a 12-byte big-endian integer. There is no final-chunk flag: the final chunk is the one shorter than 16 KiB.
+
+The ciphertext following the envelope is:
+
+```text
+salt (24 bytes) || commitment (32 bytes)
+[chunk_0_ciphertext || tag_0]
+[chunk_1_ciphertext || tag_1]
+...
+[chunk_(chunk_count - 1)_ciphertext || tag_(chunk_count - 1)]
+```
+
+Each authentication tag is 16 bytes. Every chunk except the final one is 16,400 bytes of ciphertext, and the final chunk is 16 through 16,399 bytes.
+
+#### Ciphertext Length
+
+The decoder derives the layout from the ciphertext length alone:
+
+```text
+body_length       = ciphertext_length - 56
+full_chunks       = floor(body_length / 16,400)
+last_chunk_length = body_length - full_chunks × 16,400
+chunk_count       = full_chunks + 1
+plaintext_size    = full_chunks × 16,384 + last_chunk_length - 16
+```
+
+Before attempting decryption, the decoder MUST:
+
+- require `ciphertext_length >= 72`, the salt, the commitment and one empty chunk;
+- treat a `last_chunk_length` of `0` as truncation, since the final short chunk is missing;
+- reject a `last_chunk_length` from `1` through `15`;
+- reject a `chunk_count` above `2^38`. Implementations MAY apply a lower limit, but SHOULD NOT apply one below `2^32`.
+
+These checks validate the layout only. The commitment and each chunk's authentication tag MUST still be verified during decryption.
+
+#### Declared Plaintext Length
+
+When `plaintext_length` is present, the decoder MUST compute:
+
+```text
+expected_ciphertext_length = 56 + plaintext_length + 16 × (floor(plaintext_length / 16,384) + 1)
+```
+
+and reject the object if `expected_ciphertext_length` differs from the actual ciphertext length of the same object version. As in scheme 2, an encoder that wrote `plaintext_length` MUST fail if the plaintext it consumes has a different length, and MUST NOT emit the final chunk. The protected header is bound into the key, so a chunk that verifies also verifies the declared length.
+
+#### Scheme 3 Range Decryption
+
+The requirements in [Range Decryption](#range-decryption) apply to scheme 3. To decrypt a plaintext byte range `[offset, offset + length)`:
+
+1. Parse the envelope to get `envelope_length` and, if present, `plaintext_length`.
+2. Set `ciphertext_length = blob_length - envelope_length`. Apply the checks in [Ciphertext Length](#ciphertext-length) and, when `plaintext_length` is present, [Declared Plaintext Length](#declared-plaintext-length).
+3. Require a nonempty range within `[0, plaintext_size)`.
+4. Fetch the 56 bytes after the envelope, derive `key`, `base_nonce` and the commitment, and check the commitment.
+5. For each chunk `i` from `floor(offset / 16,384)` through `floor((offset + length - 1) / 16,384)`:
+   1. Fetch from offset `envelope_length + 56 + i × 16,400`: 16,400 bytes, or `last_chunk_length` bytes when `i = chunk_count - 1`.
+   2. Decrypt with AES-256-GCM using `key`, the nonce `base_nonce XOR i` and empty AAD.
+6. Concatenate the decrypted chunks and slice to the requested range.
+
+The 56-byte prefix sits directly after the envelope, so the read that fetches the envelope usually covers it. Truncation detection matches scheme 2. With `plaintext_length` present, a verified chunk confirms the declared length. Without it, a range that does not include the final chunk cannot detect truncation, and a reader that needs the length, for example to resolve a range relative to the end of the plaintext, MUST first decrypt the final chunk.
 
 ### Multi-Recipient Support
 
@@ -435,9 +539,10 @@ Recipients within a single envelope MAY use different key wrapping algorithms. F
 ### Content Encryption Key (CEK) Requirements
 
 - The CEK MUST be exactly 32 bytes (256 bits).
-- A CEK unique to each encrypted object is RECOMMENDED. CEK generation and derivation are left to the key-management system. A key-management profile that reuses a CEK across encryptions MUST define how many encryptions may use it (see [Nonce uniqueness and CEK lifecycle](#nonce-uniqueness-and-cek-lifecycle)).
+- For schemes 1 and 2, a CEK unique to each encrypted object is RECOMMENDED. CEK generation and derivation are left to the key-management system. A key-management profile that reuses a CEK across encryptions MUST define how many encryptions may use it (see [Nonce uniqueness and CEK lifecycle](#nonce-uniqueness-and-cek-lifecycle)). Scheme 3 derives a fresh key and nonce for each encryption, so one CEK can encrypt many objects within the limits given there.
+- For scheme 3, the CEK MUST be uniformly random, for example generated by a cryptographically secure random source or output by a KDF.
 - Implementations MUST reject an all-zero CEK, including one recovered by unwrapping.
-- Encoders MUST generate the IV or base nonce from a cryptographically secure random source and MUST NOT accept a caller-supplied one.
+- Encoders MUST generate the IV, base nonce or salt from a cryptographically secure random source and MUST NOT accept a caller-supplied one.
 - Implementations SHOULD zeroize key material from memory after use.
 
 ## Design Rationale
@@ -485,6 +590,26 @@ The STREAM nonce construction (base_nonce || counter || last_flag) provides:
 - **Truncation detection**: removing the last chunk means a non-final chunk is treated as final, producing a nonce mismatch
 - **Insertion detection**: inserted chunks shift indices, breaking all subsequent nonces
 
+### Why add a key-committing scheme?
+
+Schemes 1 and 2 use AES-GCM directly, which does not commit to its key (see [Key commitment](#key-commitment)), so a multi-recipient envelope can decrypt to different content for different recipients. Scheme 3 checks a 32-byte commitment before decrypting any chunk, which gives 128-bit key commitment security. It also derives a fresh key and nonce for each encryption from a 192-bit salt, which removes scheme 2's limit of about 2^28 objects under one CEK.
+
+FEE adopts the C2SP chunked encryption construction unchanged instead of defining its own. It has a published security analysis, test vectors in Project Wycheproof and implementations in Go and Python, and a scheme 3 ciphertext decrypts with any of them given the CEK and context.
+
+### Why Cobblestone-256?
+
+C2SP recommends Cobblestone-128 and defines Cobblestone-256 as its instantiation for compliance requirements. FEE fixes the CEK at 32 bytes, and both recipient algorithms wrap a 256-bit key, so Cobblestone-256 works with FEE key management as it is.
+
+### Why are scheme 3's salt and commitment in the ciphertext?
+
+Keeping the 56-byte salt and commitment at the start of the ciphertext makes it a standard C2SP ciphertext, with no FEE-specific framing. Range readers pay nothing extra, since the prefix sits directly after the envelope they already read. Carrying the salt in the `iv` header would keep the offset arithmetic identical to scheme 2, but the ciphertext would no longer be a standard C2SP ciphertext.
+
+The `Enc_structure` is the construction's `context`, so the envelope's protected header and structure are bound into the key, as they are bound into the AAD in schemes 1 and 2.
+
+### Why does scheme 3 fix the chunk size?
+
+The construction fixes chunks at 16 KiB, the TLS 1.3 record size. A range read fetches at most 16 KiB beyond the requested range at each end. Tag overhead is about 0.1%, against about 0.006% for scheme 2 at its 256 KiB default.
+
 ### Why is the IV protected?
 
 COSE permits the IV in either header. Protected headers are readable before authentication, so placing the IV there costs the decryptor nothing: it can read the IV, then verify the tag. In exchange, the IV becomes part of the content AAD, and every FEE content parameter lives in one authenticated location. A decoder can reject any FEE parameter found in the unprotected header instead of deciding which copy to trust.
@@ -492,6 +617,8 @@ COSE permits the IV in either header. Protected headers are readable before auth
 ### Why one final-chunk form?
 
 If a plaintext that is an exact multiple of `chunk_size` could end either in a full chunk or in a full chunk followed by an empty one, the same plaintext would have two valid ciphertext lengths. A single form gives every plaintext length exactly one ciphertext length, which is what makes the `plaintext_length` check exact.
+
+Scheme 3 gets the same property from the opposite rule: its final chunk is always shorter than a full chunk, so a plaintext that is an exact multiple of 16 KiB ends in an empty chunk. That form needs no final-chunk flag, so an encoder can encrypt each full chunk as soon as it fills, and a decoder knows the final chunk by its length.
 
 ### Why a plaintext length instead of a chunk count?
 
@@ -505,10 +632,11 @@ The trade-off is that all metadata values must be known at encryption time and a
 
 ### Why private-use algorithm and header IDs?
 
-The chunked AEAD scheme uses a private-use algorithm ID, and `app_metadata` and `plaintext_length` use private-use header labels. These values are in the COSE private-use range (less than -65536), offset from -65536 to reduce collision risk with other private-use allocations:
+The chunked schemes use private-use algorithm IDs, and `app_metadata` and `plaintext_length` use private-use header labels. These values are in the COSE private-use range (less than -65536), offset from -65536 to reduce collision risk with other private-use allocations:
 
 | Value  | Range                 | Purpose                    |
 | ------ | --------------------- | -------------------------- |
+| -65794 | Private-use algorithm | Cobblestone-256            |
 | -65793 | Private-use algorithm | Chunked-AES-256-GCM-STREAM |
 | -65792 | Private-use header    | `app_metadata`             |
 | -65789 | Private-use header    | `plaintext_length`         |
@@ -533,6 +661,8 @@ Cross-implementation test vectors are maintained alongside the implementations l
 - A256KW and ECDH-ES+A256KW recipients in one envelope
 - whole-object decryption, range decryption and recipient unwrapping in both implementations
 
+There are no FEE envelope vectors for scheme 3 yet. [Project Wycheproof](https://github.com/C2SP/wycheproof/blob/main/doc/c2sp_chunked_encryption.md) covers its ciphertext layer.
+
 ## Security Considerations
 
 ### What authentication proves
@@ -545,16 +675,18 @@ Authentication failures are indistinguishable: a wrong CEK and a modified header
 
 ### Nonce uniqueness and CEK lifecycle
 
-AES-GCM requires a distinct key/nonce pair for each encryption operation. All chunks of one FEE encryption use the same CEK, with distinct per-chunk nonces; the counter MUST NOT wrap.
+AES-GCM requires a distinct key/nonce pair for each encryption operation. All chunks of one FEE encryption use the same key, with distinct per-chunk nonces; the counter MUST NOT wrap.
 
 Scheme 1 uses a randomly generated 12-byte nonce. Scheme 2 uses a randomly generated 7-byte base nonce and derives a distinct 12-byte AES-GCM nonce for each chunk from the chunk index and final-chunk flag. Chunks within one scheme 2 encryption are not separate random nonce draws, so the per-object randomness of scheme 2 is the 56-bit base nonce.
+
+Scheme 3 never uses the CEK as an AES-GCM key. Each encryption derives its own key and 12-byte base nonce from the CEK and a 192-bit random salt, and the salt MUST NOT repeat under one CEK. C2SP's analysis bounds an attacker's advantage at 2^-32 for up to 2^45 objects of 1 GiB, or 2^25 objects of 1 TiB, under one CEK.
 
 Under a reused CEK, two scheme 2 objects reach roughly even odds of a base-nonce collision after about 2^28 encryptions. A collision exposes keystream and allows tag forgery. A CEK unique to each encryption removes this risk. A key-management profile that reuses a CEK MUST keep the number of encryptions under it far below that bound, counting every writer, retry and aborted attempt.
 
 How the CEK is made unique is left to the key-management system. Two common approaches:
 
 - **A fresh CEK for each encryption.** Generate a random CEK, or derive one from a master key and context that changes for every encryption, such as a random salt carried in `app_metadata`. Each encryption, including a retry of the same plaintext, gets its own CEK. A derived CEK is recoverable by anyone holding the master key and the context; a random one must be wrapped or stored.
-- **A reproducible, object-based CEK.** Derive the CEK from a master key and an object identifier alone, such as `CEK = KDF(master_key, plaintext_CID)`. Encrypting the same object again then reuses the CEK, so a profile choosing this option must define its KDF inputs, nonce-reuse policy and per-key usage budget across all writers, retries, aborted attempts, chunks and bytes.
+- **A reproducible, object-based CEK.** Derive the CEK from a master key and an object identifier alone, such as `CEK = KDF(master_key, plaintext_CID)`. Encrypting the same object again then reuses the CEK, so a profile choosing this option must define its KDF inputs, nonce-reuse policy and per-key usage budget across all writers, retries, aborted attempts, chunks and bytes. With scheme 3, each encryption still draws a fresh salt, so this option stays within the limits above.
 
 An identical plaintext CID alone does not guarantee an identical encryption operation: protected metadata, its encoding, the envelope type or chunking may differ. Repeating identical key, nonce, plaintext and AAD gives identical output; changing AAD can change the tag even when the encrypted payload stays the same.
 
@@ -568,9 +700,11 @@ Each chunk is released as soon as its tag verifies, so a truncated or tampered s
 
 AES-GCM does not commit to its key: a sender can construct a ciphertext that authenticates under two different CEKs. In a multi-recipient envelope, a malicious sender could therefore give different recipients different CEKs that each decrypt the same object to different plaintexts. Successful decryption proves possession of a CEK and nothing about who produced the object or what other recipients see.
 
+This applies to schemes 1 and 2. Scheme 3 is key-committing: a decoder that checks the commitment before decrypting rejects every CEK other than the one the object was encrypted with, so every recipient that decrypts the object sees the same plaintext. Applications that share blobs through multi-recipient envelopes should prefer scheme 3.
+
 ### Chunk size and authentication granularity
 
-Smaller chunk sizes increase authentication granularity (less data processed before detecting tampering) but also increase per-chunk overhead and reduce maximum plaintext size for a given nonce counter width. The 4-byte counter supports up to `2^32 - 1` chunks; with the default 256 KiB chunk size this allows approximately 1 PiB of plaintext.
+Smaller chunk sizes increase authentication granularity (less data processed before detecting tampering) but also increase per-chunk overhead and reduce maximum plaintext size for a given nonce counter width. The 4-byte counter supports up to `2^32 - 1` chunks; with the default 256 KiB chunk size this allows approximately 1 PiB of plaintext. Scheme 3 fixes chunks at 16 KiB and allows up to `2^38` chunks, about 4 PiB.
 
 ### Untrusted parsing
 
@@ -596,7 +730,7 @@ This proposal does not change storage provider incentives. Storage providers sto
 
 ### Developer experience
 
-The format is designed so that a developer with access to a CBOR library and a platform AES-256-GCM implementation can build a compatible encryptor/decryptor without specialized cryptographic libraries.
+The format is designed so that a developer with access to a CBOR library and a platform AES-256-GCM implementation can build a compatible encryptor/decryptor without specialized cryptographic libraries. Scheme 3 also needs HKDF-Expand with SHA-512, which the same platform libraries generally provide.
 
 ### Storage overhead
 
@@ -605,6 +739,7 @@ The format is designed so that a developer with access to a CBOR library and a p
 | COSE envelope               | About 75 bytes without recipients; about 265 bytes with one A256KW and one ECDH-ES recipient. Grows with metadata and recipients. |
 | Scheme 1 authentication tag | 16 bytes                                                                                                                          |
 | Scheme 2 per-chunk tags     | 16 bytes per chunk; 64 KiB per 1 GiB of plaintext at 256 KiB chunks                                                               |
+| Scheme 3 prefix and tags    | 56 bytes, plus 16 bytes per 16 KiB chunk; about 1 MiB per 1 GiB of plaintext                                                      |
 
 ```
 1 GiB / 256 KiB = 4,096 chunks
@@ -612,7 +747,7 @@ The format is designed so that a developer with access to a CBOR library and a p
 65,536 / 1,073,741,824 × 100 = 0.006103515625%
 ```
 
-For a 1 GiB plaintext with 256 KiB chunks, authentication tags add approximately 0.0061%, plus the encoded envelope size.
+For a 1 GiB plaintext with 256 KiB chunks, authentication tags add approximately 0.0061%, plus the encoded envelope size. With scheme 3, the same plaintext has 65,537 chunks, so its tags and prefix add 1,048,648 bytes, approximately 0.098%.
 
 ## Implementation
 
@@ -621,15 +756,19 @@ For a 1 GiB plaintext with 256 KiB chunks, authentication tags add approximately
 
 The two are pinned against each other by cross-implementation test vectors in [`go-fee/vectors`](https://github.com/filecoin-project/go-fee/tree/main/vectors).
 
+Neither implements scheme 3 yet. [`filippo.io/cobblestone`](https://filippo.io/cobblestone) (Go) and [`pyca/cryptography`](https://cryptography.io/en/latest/cobblestone/) (Python) implement its ciphertext layer.
+
 ## Open Questions
 
 1. **Should a minimum set of recipient algorithms be required?** A256KW and ECDH-ES+A256KW over X25519 are profiled above, but implementations may support either. Requiring one would guarantee that any two implementations can exchange wrapped keys.
 2. **How should applications signal chunk size preference?** When an application re-encrypts data or produces encrypted content for a known consumer, should there be a negotiation mechanism for chunk size, or is the default sufficient?
 3. **Media type registration:** the `typ` header uses `application/vnd.filecoin-encryption+cose`. Should this be registered as an IANA media type, or is the COSE `typ` header sufficient for identification?
-4. **Algorithm registration:** should Chunked-AES-256-GCM-STREAM be registered with IANA, so that it and `chunk_size` get registered identifiers?
+4. **Algorithm registration:** should Chunked-AES-256-GCM-STREAM and Cobblestone-256 be registered with IANA, so that they and `chunk_size` get registered identifiers?
 5. **Parser limits:** should limits on envelope size, nesting depth and collection sizes be shared interoperability limits, or implementation-specific limits that each implementation documents?
-6. **Key commitment:** should a future scheme add key commitment, for example the [C2SP chunked encryption](https://c2sp.org/chunked-encryption) construction?
-7. **Final-chunk flag width:** moving from a final-chunk flag byte to a single flag bit would add 7 bits to the chunk counter. It is not proposed here, for simplicity.
+6. **Default chunked scheme:** should scheme 3 be RECOMMENDED for new objects, with scheme 2 kept for objects that already use it?
+7. **Cobblestone-128:** should FEE also define C2SP's recommended 128-bit instantiation? It would need 16-byte CEKs and a matching key wrap.
+8. **Scheme 3 salt placement:** the salt and commitment could travel as header parameters, keeping the ciphertext pure chunk data and the offset arithmetic identical to scheme 2. The ciphertext would then no longer be a standard C2SP ciphertext.
+9. **Final-chunk flag width:** moving from a final-chunk flag byte to a single flag bit would add 7 bits to the chunk counter. It is not proposed here, for simplicity.
 
 ## TODO
 
@@ -650,6 +789,10 @@ The two are pinned against each other by cross-implementation test vectors in [`
 - [Hoang, Reyhanitabar, Rogaway, Vizár — Online Authenticated-Encryption and its Nonce-Reuse Misuse-Resistance (2015)](https://eprint.iacr.org/2015/189)
 - [C2SP age — STREAM encryption](https://age-encryption.org/v1)
 - [Google Tink — Streaming AEAD](https://developers.google.com/tink/streaming-aead)
+- [C2SP — Chunked encryption](https://c2sp.org/chunked-encryption)
+- [Project Wycheproof — C2SP chunked encryption test vectors](https://github.com/C2SP/wycheproof/blob/main/doc/c2sp_chunked_encryption.md)
+- [Dodis, Grubbs, Ristenpart, Woodage — Fast Message Franking: From Invisible Salamanders to Encryptment (2018)](https://eprint.iacr.org/2019/016)
+- [Len, Grubbs, Ristenpart — Partitioning Oracle Attacks (2021)](https://eprint.iacr.org/2020/1491)
 
 ## Copyright
 

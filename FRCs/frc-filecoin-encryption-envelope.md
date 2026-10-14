@@ -1,7 +1,7 @@
 ---
 fip: "<to be assigned>"
 title: Filecoin Encryption Envelope
-author: "Jakub Sztandera (@Kubuxu), Natalie Bravo (@bravonatalie)"
+author: "Jakub Sztandera (@Kubuxu), Natalie Bravo (@bravonatalie), Alan Shaw (@alanshaw)"
 discussions-to: https://github.com/filecoin-project/FIPs/discussions/1253
 status: Draft
 type: FRC
@@ -354,18 +354,20 @@ These checks validate the layout only. Each chunk's authentication tag MUST stil
 
 #### Plaintext Length
 
-`plaintext_length` (label -65789) is the exact number of plaintext bytes and may be zero. It is optional and appears only in the protected header of schemes 2 and 3. This section gives the scheme 2 rules; [Declared Plaintext Length](#declared-plaintext-length) gives the scheme 3 rules. Every chunk authenticates the protected header, so verifying any one chunk also verifies the intended total length. A range read can then detect a shortened or extended blob without reading the final chunk.
+`plaintext_length` (label -65789) is the exact number of plaintext bytes and may be zero. It is optional, appears only in the protected header, and is defined for schemes 2 and 3. The rules in this section apply to both schemes; each scheme defines its own `expected_ciphertext_length`.
 
 An encoder MAY write `plaintext_length` when it knows the length before emitting the envelope; otherwise it omits it. If the plaintext it consumes has a different length, the encoder MUST fail and MUST NOT emit the final chunk. Earlier chunks may already have been emitted.
 
-When `plaintext_length` is present, the decoder MUST compute:
+When `plaintext_length` is present, the decoder MUST compute `expected_ciphertext_length` and reject the object if it differs from the actual ciphertext length of the same object version. The decoder still derives the layout from the actual ciphertext length and applies that scheme's layout checks. The value is unverified until a chunk verifies. Every chunk's authentication covers the protected header, so once any chunk verifies, a range read can detect a shortened or extended blob without reading the final chunk.
+
+For scheme 2, the layout checks are in [Length Derivation](#length-derivation), and:
 
 ```text
 expected_chunk_count       = max(1, ceil(plaintext_length / chunk_size))
 expected_ciphertext_length = plaintext_length + 16 × expected_chunk_count
 ```
 
-and reject the object if `expected_ciphertext_length` differs from the actual ciphertext length of the same object version. The decoder still derives the layout from the actual ciphertext length and applies the checks in [Length Derivation](#length-derivation). The value is unverified until a chunk's tag verifies.
+Scheme 3 defines its formula in [Declared Plaintext Length](#declared-plaintext-length).
 
 #### Range Decryption
 
@@ -462,13 +464,13 @@ These checks validate the layout only. The commitment and each chunk's authentic
 
 #### Declared Plaintext Length
 
-When `plaintext_length` is present, the decoder MUST compute:
+The rules in [Plaintext Length](#plaintext-length) apply. For scheme 3, the layout checks are in [Ciphertext Length](#ciphertext-length), and:
 
 ```text
 expected_ciphertext_length = 56 + plaintext_length + 16 × (floor(plaintext_length / 16,384) + 1)
 ```
 
-and reject the object if `expected_ciphertext_length` differs from the actual ciphertext length of the same object version. As in scheme 2, an encoder that wrote `plaintext_length` MUST fail if the plaintext it consumes has a different length, and MUST NOT emit the final chunk. The protected header is bound into the key, so a chunk that verifies also verifies the declared length.
+The protected header is bound into the key, so a chunk that verifies also verifies the declared length.
 
 #### Scheme 3 Range Decryption
 
@@ -730,7 +732,7 @@ This proposal does not change storage provider incentives. Storage providers sto
 
 ### Developer experience
 
-The format is designed so that a developer with access to a CBOR library and a platform AES-256-GCM implementation can build a compatible encryptor/decryptor without specialized cryptographic libraries. Scheme 3 also needs HKDF-Expand with SHA-512, which the same platform libraries generally provide.
+The format is designed so that a developer with access to a CBOR library and a platform AES-256-GCM implementation can build a compatible encryptor/decryptor without specialized cryptographic libraries. Scheme 3 also needs HKDF-Expand with SHA-512, without the Extract step. Go's `crypto/hkdf` and Python's `cryptography` package provide it directly; WebCrypto and Node expose only full HKDF, so JavaScript implementations build Expand from HMAC-SHA-512 (RFC 5869 §2.3).
 
 ### Storage overhead
 

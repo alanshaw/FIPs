@@ -592,15 +592,21 @@ The STREAM nonce construction (base_nonce || counter || last_flag) provides:
 - **Truncation detection**: removing the last chunk means a non-final chunk is treated as final, producing a nonce mismatch
 - **Insertion detection**: inserted chunks shift indices, breaking all subsequent nonces
 
-### Why add a key-committing scheme?
+### Why add Cobblestone?
 
-Schemes 1 and 2 use AES-GCM directly, which does not commit to its key (see [Key commitment](#key-commitment)), so a multi-recipient envelope can decrypt to different content for different recipients. Scheme 3 checks a 32-byte commitment before decrypting any chunk, which gives 128-bit key commitment security. It also derives a fresh key and nonce for each encryption from a 192-bit salt, which removes scheme 2's limit of about 2^28 objects under one CEK.
+Scheme 3 lets one CEK safely encrypt many objects. Scheme 2 uses the CEK directly as the AES-GCM key with a 56-bit random base nonce, so under a reused CEK two objects reach roughly even odds of a nonce collision after about 2^28 encryptions, and a key-management profile that reuses a CEK has to count every writer, retry and aborted attempt to stay far below that. Scheme 3 never uses the CEK as an AES-GCM key. It derives a fresh key and nonce for each encryption from a 192-bit random salt, and C2SP bounds an attacker's advantage at 2^-32 for up to 2^45 objects of 1 GiB under one CEK (see [Nonce uniqueness and CEK lifecycle](#nonce-uniqueness-and-cek-lifecycle)). A reproducible CEK, such as one derived from a master key and the plaintext CID, stays within those limits without a shared encryption counter.
+
+Scheme 3 also commits to its key. Schemes 1 and 2 use AES-GCM directly, which does not commit to its key (see [Key commitment](#key-commitment)), so a multi-recipient envelope can decrypt to different content for different recipients. Scheme 3 checks a 32-byte commitment before decrypting any chunk, which gives 128-bit key commitment security.
 
 FEE adopts the C2SP chunked encryption construction unchanged instead of defining its own. It has a published security analysis, test vectors in Project Wycheproof and implementations in Go and Python, and a scheme 3 ciphertext decrypts with any of them given the CEK and context.
 
 ### Why Cobblestone-256?
 
-C2SP recommends Cobblestone-128 and defines Cobblestone-256 as its instantiation for compliance requirements. FEE fixes the CEK at 32 bytes, and both recipient algorithms wrap a 256-bit key, so Cobblestone-256 works with FEE key management as it is.
+FEE ciphertext is public and long-lived. Anyone can retrieve a blob from a storage provider, copies outlive any deletion, and an object cannot be re-encrypted once others hold it. The key size has to hold for the life of the data, against an attacker who can collect every object on the network.
+
+C2SP recommends Cobblestone-128 and defines Cobblestone-256 for compliance. Its security analysis for 128-bit keys assumes an attacker limited to 2^80 offline work; with 256-bit keys that assumption is unnecessary. Key search on AES-256 is NIST's benchmark for its highest post-quantum security category, and NSA's CNSA 2.0 requires 256-bit AES keys for national security systems.
+
+The cost is small: the ciphertext layout and overhead are identical, and AES-256 runs 14 rounds to AES-128's 10.
 
 ### Why are scheme 3's salt and commitment in the ciphertext?
 
@@ -793,6 +799,8 @@ Neither implements scheme 3 yet. [`filippo.io/cobblestone`](https://filippo.io/c
 - [Google Tink — Streaming AEAD](https://developers.google.com/tink/streaming-aead)
 - [C2SP — Chunked encryption](https://c2sp.org/chunked-encryption)
 - [Project Wycheproof — C2SP chunked encryption test vectors](https://github.com/C2SP/wycheproof/blob/main/doc/c2sp_chunked_encryption.md)
+- [NIST — Post-Quantum Cryptography Standardization: Security (Evaluation Criteria)](https://csrc.nist.gov/projects/post-quantum-cryptography/post-quantum-cryptography-standardization/evaluation-criteria/security-(evaluation-criteria))
+- [NSA — Announcing the Commercial National Security Algorithm Suite 2.0](https://media.defense.gov/2025/May/30/2003728741/-1/-1/0/CSA_CNSA_2.0_ALGORITHMS.PDF)
 - [Dodis, Grubbs, Ristenpart, Woodage — Fast Message Franking: From Invisible Salamanders to Encryptment (2018)](https://eprint.iacr.org/2019/016)
 - [Len, Grubbs, Ristenpart — Partitioning Oracle Attacks (2021)](https://eprint.iacr.org/2020/1491)
 
